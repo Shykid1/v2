@@ -1,0 +1,464 @@
+// SaniChain v2 — sanitation service coordination network.
+// The Job is the heart of the system: all triggers converge on it and all
+// surfaces read from it. See v2/docs/prd.md §6 for the conceptual model.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  household
+  provider
+  admin
+  district_officer
+}
+
+enum HouseholdTier {
+  sensored
+  unsensored
+}
+
+enum PitSize {
+  standard
+  large_shared
+}
+
+enum DistanceZone {
+  near
+  mid
+  remote
+}
+
+enum LocationSource {
+  sensor_gprs
+  ghanapost_gps
+  manual
+}
+
+enum TriggerSource {
+  sensor_fill
+  climate_preempt
+  ussd_report
+  guest_request
+  dashboard
+}
+
+enum JobStatus {
+  PENDING_APPROVAL
+  CREATED
+  OFFERED
+  ASSIGNED
+  ACCEPTED
+  EN_ROUTE
+  COMPLETED
+  PAID
+  PAID_CASH
+  CLOSED
+  SLA_BREACHED
+  CANCELLED
+}
+
+enum DispatchMode {
+  assisted
+  auto
+}
+
+enum JobOfferStatus {
+  pending
+  accepted
+  declined
+  expired
+}
+
+enum PaymentMethod {
+  paystack
+  cash
+}
+
+enum PaymentPurpose {
+  job
+  sensor_purchase
+}
+
+enum PaymentStatus {
+  pending
+  success
+  failed
+  refunded
+}
+
+enum ProviderVerificationStatus {
+  pending
+  verified
+  rejected
+}
+
+enum KycStatus {
+  not_started
+  pending
+  verified
+}
+
+enum LedgerEntryType {
+  commission_accrued
+  payout_netted
+  auto_charge
+  adjustment
+}
+
+enum NotificationChannel {
+  whatsapp
+  sms
+  ussd
+}
+
+enum NotificationStatus {
+  pending
+  sent
+  failed
+}
+
+// ─── Identity ────────────────────────────────────────────────────────────────
+
+model User {
+  id                 String    @id @default(cuid())
+  email              String?   @unique
+  phone              String    @unique
+  whatsappNumber     String?
+  passwordHash       String?
+  name               String
+  role               UserRole
+  active             Boolean   @default(true)
+  mustChangePassword Boolean   @default(false)
+  deletedAt          DateTime?
+  createdAt          DateTime  @default(now())
+
+  household       Household?
+  provider        Provider?
+  districtOfficer DistrictOfficer?
+
+  @@map("users")
+}
+
+model DistrictOfficer {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  title     String? // e.g. "District Environmental Health Officer"
+  district  String? // scope of oversight
+  region    String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([district])
+  @@map("district_officers")
+}
+
+model Household {
+  id                   String        @id @default(cuid())
+  userId               String        @unique
+  tier                 HouseholdTier @default(unsensored)
+  defaultPaymentMethod PaymentMethod @default(cash)
+  district             String?
+  community            String?
+  createdAt            DateTime      @default(now())
+
+  user User  @relation(fields: [userId], references: [id])
+  pits Pit[]
+  jobs Job[]
+
+  @@map("households")
+}
+
+// ─── Location reference data (Ghana regions + districts) ─────────────────────
+// Canonical list used to power location selects so district/region values stay
+// consistent across households, providers, pits, and district officers.
+
+model Region {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  districts District[]
+
+  @@map("regions")
+}
+
+model District {
+  id       String @id @default(cuid())
+  name     String @unique
+  regionId String
+  region   Region @relation(fields: [regionId], references: [id], onDelete: Cascade)
+
+  @@index([regionId])
+  @@map("districts")
+}
+
+model Provider {
+  id                    String                     @id @default(cuid())
+  userId                String                     @unique
+  businessName          String
+  coverageZones         String[]                   @default([])
+  region                String?
+  district              String?
+  vehicleCapacityLiters Int?
+  baseLat               Float?
+  baseLng               Float?
+  available             Boolean                    @default(true)
+  verificationStatus    ProviderVerificationStatus @default(pending)
+  kycStatus             KycStatus                  @default(not_started)
+  paystackSubaccountCode String?
+  creditLimit           Decimal                    @default(0) @db.Decimal(10, 2)
+  ledgerBalance         Decimal                    @default(0) @db.Decimal(10, 2)
+  createdAt             DateTime                   @default(now())
+
+  user          User                   @relation(fields: [userId], references: [id])
+  jobs          Job[]
+  offers        JobOffer[]
+  ledgerEntries CommissionLedgerEntry[]
+
+  @@map("providers")
+}
+
+// ─── Pits, devices, readings ─────────────────────────────────────────────────
+
+model Pit {
+  id               String         @id @default(cuid())
+  code             String         @unique
+  householdId      String
+  name             String?
+  lat              Float?
+  lng              Float?
+  ghanaPostAddress String?
+  locationSource   LocationSource @default(manual)
+  sizeClass        PitSize        @default(standard)
+  zone             DistanceZone   @default(near)
+  sensored         Boolean        @default(false)
+  pitDepthCm       Int            @default(200)
+  dropHoles        Int?
+  floodRisk        Boolean        @default(false)
+  district         String?
+  community        String?
+  active           Boolean        @default(true)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  household Household @relation(fields: [householdId], references: [id])
+  devices   Device[]
+  readings  Reading[]
+  jobs      Job[]
+
+  @@map("pits")
+}
+
+model Device {
+  id          String    @id @default(cuid())
+  deviceId    String    @unique
+  pitId       String
+  hmacKey     String
+  installedAt DateTime?
+  lastSeen    DateTime?
+  lastLat     Float?
+  lastLng     Float?
+  active      Boolean   @default(true)
+
+  pit Pit @relation(fields: [pitId], references: [id])
+
+  @@map("devices")
+}
+
+model Reading {
+  id           String   @id @default(cuid())
+  pitId        String
+  deviceId     String
+  fillPct      Decimal  @db.Decimal(5, 2)
+  fillCm       Decimal  @db.Decimal(7, 2)
+  temperatureC Decimal? @db.Decimal(5, 2)
+  humidityPct  Decimal? @db.Decimal(5, 2)
+  batteryMv    Int?
+  rssi         Int?
+  hmacValid    Boolean
+  sensorTs     DateTime
+  receivedAt   DateTime @default(now())
+  lat          Float?
+  lng          Float?
+
+  pit Pit @relation(fields: [pitId], references: [id])
+
+  @@unique([deviceId, sensorTs])
+  @@index([pitId, sensorTs(sort: Desc)])
+  @@map("readings")
+}
+
+// ─── Job lifecycle (the heart) ───────────────────────────────────────────────
+
+model Job {
+  id                String        @id @default(cuid())
+  pitId             String
+  householdId       String
+  triggerSource     TriggerSource
+  status            JobStatus     @default(CREATED)
+  dispatchMode      DispatchMode  @default(assisted)
+  assignedProviderId String?
+  priorityScore     Float         @default(0)
+  priceTotal        Decimal?      @db.Decimal(10, 2)
+  priceBreakdown    Json          @default("{}")
+  paymentMethod     PaymentMethod @default(cash)
+  guestPhone        String?
+  guestWhatsapp     String?
+  notes             String?
+  climateSnapshotId String?
+  slaDeadline       DateTime?
+  approvalRequestedAt DateTime?
+  approvalDeadline    DateTime?
+  approvedAt          DateTime?
+  overdueFlaggedAt    DateTime?
+  createdAt         DateTime      @default(now())
+  offeredAt         DateTime?
+  acceptedAt        DateTime?
+  enRouteAt         DateTime?
+  completedAt       DateTime?
+  paidAt            DateTime?
+  closedAt          DateTime?
+  cancelledReason   String?
+
+  pit             Pit              @relation(fields: [pitId], references: [id])
+  household       Household        @relation(fields: [householdId], references: [id])
+  provider        Provider?        @relation(fields: [assignedProviderId], references: [id])
+  climateSnapshot ClimateSnapshot? @relation(fields: [climateSnapshotId], references: [id])
+  offers          JobOffer[]
+  payment         Payment?
+  ledgerEntries   CommissionLedgerEntry[]
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([assignedProviderId, status])
+  @@map("jobs")
+}
+
+model JobOffer {
+  id          String         @id @default(cuid())
+  jobId       String
+  providerId  String
+  status      JobOfferStatus @default(pending)
+  offeredAt   DateTime       @default(now())
+  respondedAt DateTime?
+  expiresAt   DateTime
+
+  job      Job      @relation(fields: [jobId], references: [id])
+  provider Provider @relation(fields: [providerId], references: [id])
+
+  @@unique([jobId, providerId])
+  @@index([providerId, status])
+  @@map("job_offers")
+}
+
+// ─── Payments & ledger ───────────────────────────────────────────────────────
+
+model Payment {
+  id                String         @id @default(cuid())
+  jobId             String?        @unique
+  householdId       String?
+  providerId        String?
+  purpose           PaymentPurpose @default(job)
+  method            PaymentMethod
+  status            PaymentStatus  @default(pending)
+  amount            Decimal        @db.Decimal(10, 2)
+  currency          String         @default("GHS")
+  commissionAmount  Decimal?       @db.Decimal(10, 2)
+  providerAmount    Decimal?       @db.Decimal(10, 2)
+  subaccountCode    String?
+  paystackRef       String?        @unique
+  paystackAccessCode String?
+  authorizationCode String?
+  idempotencyKey    String?        @unique
+  paidAt            DateTime?
+  createdAt         DateTime       @default(now())
+
+  job Job? @relation(fields: [jobId], references: [id])
+
+  @@index([status, createdAt(sort: Desc)])
+  @@map("payments")
+}
+
+model CommissionLedgerEntry {
+  id           String          @id @default(cuid())
+  providerId   String
+  jobId        String?
+  type         LedgerEntryType
+  amount       Decimal         @db.Decimal(10, 2) // signed: +accrued owed, -settled
+  balanceAfter Decimal         @db.Decimal(10, 2)
+  note         String?
+  createdAt    DateTime        @default(now())
+
+  provider Provider @relation(fields: [providerId], references: [id])
+  job      Job?     @relation(fields: [jobId], references: [id])
+
+  @@index([providerId, createdAt(sort: Desc)])
+  @@map("commission_ledger_entries")
+}
+
+// ─── Channels ────────────────────────────────────────────────────────────────
+
+model Notification {
+  id        String              @id @default(cuid())
+  channel   NotificationChannel
+  template  String
+  recipient String
+  body      String?
+  payload   Json                @default("{}")
+  status    NotificationStatus  @default(pending)
+  jobId     String?
+  error     String?
+  createdAt DateTime            @default(now())
+
+  @@index([jobId])
+  @@map("notifications")
+}
+
+// ─── Climate ─────────────────────────────────────────────────────────────────
+
+model ClimateSnapshot {
+  id                String   @id @default(cuid())
+  district          String
+  snapshotTs        DateTime
+  chirpsMm72h       Decimal  @db.Decimal(8, 2)
+  glofasProbability Decimal  @db.Decimal(5, 4)
+  speiValue         Decimal  @db.Decimal(5, 2)
+  floodSignal       Decimal  @db.Decimal(4, 3)
+  droughtSignal     Decimal  @db.Decimal(4, 3)
+  riskScore         Decimal  @db.Decimal(4, 3)
+  createdAt         DateTime @default(now())
+
+  jobs Job[]
+
+  @@unique([district, snapshotTs])
+  @@index([district, snapshotTs(sort: Desc)])
+  @@map("climate_snapshots")
+}
+
+// ─── Pricing & config (admin-editable) ───────────────────────────────────────
+
+model PricingRule {
+  id              String       @id @default(cuid())
+  sizeClass       PitSize
+  zone            DistanceZone
+  basePrice       Decimal      @db.Decimal(10, 2)
+  accessSurcharge Decimal      @default(0) @db.Decimal(10, 2)
+  currency        String       @default("GHS")
+  active          Boolean      @default(true)
+
+  @@unique([sizeClass, zone])
+  @@map("pricing_rules")
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
