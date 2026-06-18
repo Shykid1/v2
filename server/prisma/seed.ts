@@ -35,7 +35,31 @@ const randInt = (min: number, max: number) =>
   Math.floor(rnd() * (max - min + 1)) + min;
 const chance = (p: number) => rnd() < p;
 const daysAgo = (d: number) => new Date(Date.now() - d * 86_400_000);
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000);
 const jitter = (v: number, by: number) => v + (rnd() - 0.5) * by;
+
+// Pick a believable `createdAt` for a job given its status. In-progress states are
+// anchored to recent hours so their relative-time labels read as live and their
+// `slaDeadline` (= createdAt + 48h) stays in the future; SLA_BREACHED is pushed far
+// enough back that the deadline is genuinely passed; settled/closed history stays aged.
+function createdAtForStatus(status: JobStatus): Date {
+  switch (status) {
+    case 'CREATED':
+    case 'OFFERED':
+    case 'ASSIGNED':
+    case 'ACCEPTED':
+    case 'EN_ROUTE':
+      return hoursAgo(randInt(1, 36));
+    case 'PENDING_APPROVAL':
+      return hoursAgo(randInt(1, 40));
+    case 'COMPLETED':
+      return daysAgo(randInt(2, 5));
+    case 'SLA_BREACHED':
+      return daysAgo(randInt(3, 10));
+    default: // PAID, PAID_CASH, CLOSED, CANCELLED — historical, fine to age
+      return daysAgo(randInt(3, 90));
+  }
+}
 
 // ─── Reference data ──────────────────────────────────────────────────────────
 // Districts used to generate realistic demo operational data (pits, climate,
@@ -260,6 +284,9 @@ async function main() {
   const pits: SeedPit[] = [];
   let pitSeq = 0;
   let deviceSeq = 0;
+  // Captured so we can anchor a guaranteed demo job on the known household login.
+  let aminaPitId: string | null = null;
+  let aminaHouseholdId: string | null = null;
 
   // Fixed demo households first (kept for docs/screens).
   const fixed = [
@@ -277,7 +304,8 @@ async function main() {
     districtIdx: number;
     community: string;
     fixedCode?: string;
-  }) {
+    forceCriticalFill?: boolean;
+  }): Promise<{ pitId: string; householdId: string }> {
     const d = DISTRICTS[opts.districtIdx];
     const user = await prisma.user.create({
       data: {
@@ -339,7 +367,11 @@ async function main() {
       deviceSeq += 1;
       const deviceId = `SANI-ESP32-${String(deviceSeq).padStart(3, '0')}`;
       // A current fill target; a few pits sit critically full to drive alerts.
-      const currentFill = chance(0.18) ? randInt(80, 96) : randInt(20, 78);
+      const currentFill = opts.forceCriticalFill
+        ? randInt(85, 95)
+        : chance(0.18)
+          ? randInt(80, 96)
+          : randInt(20, 78);
       const days = 45;
       // Build a rising series that ends near currentFill.
       const start = Math.max(5, currentFill - days * 1.7);
@@ -378,10 +410,13 @@ async function main() {
       });
       await prisma.reading.createMany({ data: readings });
     }
+
+    return { pitId: pit.id, householdId: user.household!.id };
   }
 
   for (const f of fixed) {
-    await createHouseholdWithPit({
+    const isAmina = f.name.startsWith('Amina');
+    const res = await createHouseholdWithPit({
       name: f.name,
       phone: f.phone,
       email: f.email,
@@ -390,8 +425,15 @@ async function main() {
       pay: f.pay,
       districtIdx: f.district,
       community: f.community,
-      fixedCode: f.name.startsWith('Amina') ? 'PIT-00001' : 'PIT-00002',
+      fixedCode: isAmina ? 'PIT-00001' : 'PIT-00002',
+      // Amina is the demo sensored household — keep her pit critically full so the
+      // red fill gauge + a guaranteed pending-approval job line up for the demo.
+      forceCriticalFill: isAmina,
     });
+    if (isAmina) {
+      aminaPitId = res.pitId;
+      aminaHouseholdId = res.householdId;
+    }
   }
 
   const TOTAL_HOUSEHOLDS = 42;
@@ -434,7 +476,7 @@ async function main() {
     for (let i = 0; i < plan.count; i++) {
       const pit = pick(pits);
       const price = priceFor(pit.sizeClass, pit.zone);
-      const created = daysAgo(randInt(0, 90));
+      let created = createdAtForStatus(plan.status);
       const paymentMethod: PaymentMethod = chance(0.5) ? 'paystack' : 'cash';
 
       const isSystemTrigger =
@@ -459,14 +501,19 @@ async function main() {
           ? pick(verifiedProviders)
           : null;
 
-      // Approval timestamps for the pending state (some overdue).
-      const overdue = plan.status === 'PENDING_APPROVAL' && chance(0.4);
+      // Approval timestamps for the pending state. Force the first pending-approval
+      // job overdue so the district "overdue" badge/metric is always populated.
+      const overdue =
+        plan.status === 'PENDING_APPROVAL' && (i === 0 || chance(0.4));
+      // Overdue approvals need an older `created` so the request precedes the
+      // (now passed) deadline.
+      if (overdue) created = daysAgo(randInt(1, 3));
       const approvalRequestedAt =
         plan.status === 'PENDING_APPROVAL' ? created : null;
       const approvalDeadline =
         plan.status === 'PENDING_APPROVAL'
           ? overdue
-            ? daysAgo(randInt(0, 2)) // already passed
+            ? new Date(created.getTime() + randInt(6, 18) * 3_600_000) // already passed
             : new Date(Date.now() + randInt(2, 11) * 3_600_000)
           : null;
 
@@ -591,6 +638,66 @@ async function main() {
         }
       }
     }
+  }
+
+  // ── Guaranteed, present-anchored demo records on the known logins ─────────────
+  // An OFFERED job waiting for the demo provider (Kwame) to accept — open offer
+  // with a live ~8-minute expiry countdown.
+  const kwame = providers[0]; // providerSeeds[0] = Kwame, verified
+  {
+    const offerPit = pick(pits);
+    const offerPrice = priceFor(offerPit.sizeClass, offerPit.zone);
+    const offerCreated = hoursAgo(randInt(1, 2));
+    const offerJob = await prisma.job.create({
+      data: {
+        pitId: offerPit.id,
+        householdId: offerPit.householdId,
+        triggerSource: TriggerSource.dashboard,
+        status: 'OFFERED',
+        dispatchMode: 'assisted',
+        priorityScore: Number((rnd() * 100).toFixed(1)),
+        priceTotal: offerPrice.total,
+        priceBreakdown: offerPrice,
+        paymentMethod: 'paystack',
+        slaDeadline: new Date(offerCreated.getTime() + 48 * 3_600_000),
+        createdAt: offerCreated,
+        offeredAt: offerCreated,
+      },
+    });
+    await prisma.jobOffer.create({
+      data: {
+        jobId: offerJob.id,
+        providerId: kwame.id,
+        expiresAt: new Date(Date.now() + 8 * 60_000),
+      },
+    });
+    jobsCreated++;
+  }
+
+  // A sensor-triggered PENDING_APPROVAL job on Amina's (demo sensored household)
+  // critically-full pit, awaiting her approval before a desludger is dispatched.
+  if (aminaPitId && aminaHouseholdId) {
+    const aPit = pits.find((p) => p.id === aminaPitId)!;
+    const aPrice = priceFor(aPit.sizeClass, aPit.zone);
+    const requestedAt = new Date();
+    await prisma.job.create({
+      data: {
+        pitId: aminaPitId,
+        householdId: aminaHouseholdId,
+        triggerSource: TriggerSource.sensor_fill,
+        status: 'PENDING_APPROVAL',
+        dispatchMode: 'auto',
+        priorityScore: Number((rnd() * 100).toFixed(1)),
+        priceTotal: aPrice.total,
+        priceBreakdown: aPrice,
+        paymentMethod: 'paystack',
+        slaDeadline: new Date(Date.now() + 48 * 3_600_000),
+        approvalRequestedAt: requestedAt,
+        approvalDeadline: new Date(Date.now() + 6 * 3_600_000),
+        createdAt: requestedAt,
+      },
+    });
+    jobsCreated++;
   }
 
   // Persist running ledger balances onto providers.
